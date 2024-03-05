@@ -7,10 +7,12 @@ project ("server")
 find_package(ixwebsocket CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
+find_package(efsw CONFIG REQUIRED)
 # Добавьте источник в исполняемый файл этого проекта.
-add_executable (server "server.cpp" "server.h" "Watchdog.h"  "json.hpp")
+add_executable (server "server.cpp" "server.h"   "json.hpp" )
 target_link_libraries(${PROJECT_NAME} PRIVATE ixwebsocket::ixwebsocket )
 target_link_libraries(${PROJECT_NAME} PRIVATE ZLIB::ZLIB)
 target_link_libraries(${PROJECT_NAME} PRIVATE spdlog::spdlog)
+target_link_libraries(${PROJECT_NAME} PRIVATE efsw::efsw)
 set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 17)
 # TODO: Добавьте тесты и целевые объекты, если это необходимо.

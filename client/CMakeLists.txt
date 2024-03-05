@@ -9,7 +9,7 @@ find_package(ZLIB REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
    
 # Добавьте источник в исполняемый файл этого проекта.
-add_executable (client "client.cpp" "client.h" "json.hpp")
+add_executable (client "client.cpp" "client.h" "json.hpp" )
 target_link_libraries(${PROJECT_NAME} PRIVATE ixwebsocket::ixwebsocket )
 target_link_libraries(${PROJECT_NAME} PRIVATE ZLIB::ZLIB)
 target_link_libraries(${PROJECT_NAME} PRIVATE spdlog::spdlog)

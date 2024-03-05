@@ -2,7 +2,7 @@
 //
 
 #include "server.h"
-#include "Watchdog.h"
+
 #include <ixwebsocket/IXWebSocketServer.h>
 #include <ixwebsocket/IXNetSystem.h>
 #include <filesystem>
@@ -11,8 +11,50 @@
 #include "json.hpp"
 #include "spdlog/spdlog.h"
 #include <sstream>
+#include <efsw/efsw.hpp>
+#include <codecvt> // codecvt_utf8
+#include <locale>  // wstring_convert
+
 using namespace std;
 namespace fs = std::filesystem;
+std::wstring from_utf8(const std::string& utf8_string) {
+    static std::wstring_convert<std::codecvt_utf8<wchar_t>> utf8_conv;
+    return utf8_conv.from_bytes(utf8_string);
+}
+std::string to_utf8(const std::wstring& wide_string)
+{
+    static std::wstring_convert<std::codecvt_utf8<wchar_t>> utf8_conv;
+    return utf8_conv.to_bytes(wide_string);
+}
+class UpdateListener : public efsw::FileWatchListener {
+public:
+    UpdateListener(std::atomic_bool& need_update_):need_update(need_update_)
+    {
+
+    }
+    void handleFileAction(efsw::WatchID watchid, const std::string& dir,
+        const std::string& filename, efsw::Action action,
+        std::string oldFilename) override {
+        switch (action) {
+        case efsw::Actions::Add:
+            need_update.store(true);
+            spdlog::info("File add:{}", filename);
+            break;
+        case efsw::Actions::Delete:
+            break;
+        case efsw::Actions::Modified:
+            need_update.store(true);
+            spdlog::info("File modified:{}", filename);
+            break;
+        case efsw::Actions::Moved:
+            break;
+        default:
+            std::cout << "Should never happen!" << std::endl;
+        }
+    }
+private:
+    std::atomic_bool&                                            need_update;
+};
 class ServerUpdate
 {
 public:
@@ -23,21 +65,22 @@ public:
 private:
     void HashFS();
     size_t OneHash();
-    std::tuple<std::size_t, std::vector<uint8_t>> ServerUpdate::hash_file(const std::string& filepath);
+    std::tuple<std::size_t, std::vector<uint8_t>> ServerUpdate::hash_file(const fs::path& filepath);
     std::size_t one_hash{ 0 };
     std::unique_ptr< ix::WebSocketServer> server;
     std::atomic_bool                                            need_update{ false };
     std::string dir_path;
     std::map<std::string, std::tuple<std::size_t,std::vector<uint8_t>>> file_hash;
-
+    efsw::FileWatcher* fileWatcher;
+    UpdateListener* listener;
 };
 void ServerUpdate::StartUpdate()
 {
+    
     one_hash = OneHash();
-    wd::watch(fs::path(dir_path),
-        [&](const fs::path& path) { 
-            SPDLOG_INFO("Server files update");
-            need_update.store(true, std::memory_order_seq_cst); });
+    efsw::WatchID watchID = fileWatcher->addWatch(dir_path, listener, true);
+    fileWatcher->watch();
+   
     
 }
 void ServerUpdate::HashFS()
@@ -47,7 +90,7 @@ void ServerUpdate::HashFS()
         if (entry.is_regular_file())
         {
             fs::path relative_path = entry.path().lexically_relative(dir_path);
-            file_hash.emplace(relative_path.u8string(), hash_file(entry.path().u8string()));
+            file_hash.insert_or_assign(relative_path.u8string(), hash_file(entry.path()));
 
 
         }
@@ -65,12 +108,13 @@ size_t ServerUpdate::OneHash()
     }
     return result;
 }
-std::tuple<std::size_t, std::vector<uint8_t>> ServerUpdate::hash_file(const std::string& filepath) {
+std::tuple<std::size_t, std::vector<uint8_t>> ServerUpdate::hash_file(const fs::path& filepath) {
     // Открываем файл для чтения в бинарном режиме
     std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        SPDLOG_ERROR("Failed to open file:{} ", filepath);
-        return std::make_tuple(0,std::vector<uint8_t>()); // Возврат 0 в случае ошибки
+    while (!file.is_open()) {
+        spdlog::error("Failed to open file:{} ", filepath.u8string());
+        std::this_thread::sleep_for(5s);
+       // return std::make_tuple(0,std::vector<uint8_t>()); // Возврат 0 в случае ошибки
     }
 
     // Создаем объект хэш-функции
@@ -88,27 +132,26 @@ void ServerUpdate::MessageCallback(std::shared_ptr<ix::ConnectionState> connecti
     // The ConnectionState object contains information about the connection,
       // at this point only the client ip address and the port.
    
-    SPDLOG_INFO("Remote ip: {}", connectionState->getRemoteIp());
+    
+    if (need_update.load() == true)
+    {
+        one_hash = OneHash();
+        need_update.store(false);
+        nlohmann::json pack;
+        pack["command"] = "send_hash";
+        webSocket.sendBinary(nlohmann::json::to_cbor(pack));
+        spdlog::trace("Need update");
+        return;
+
+    }
     if (msg->type == ix::WebSocketMessageType::Open)
     {
-        std::stringstream ss;
-        ss<< "New connection" << std::endl;
-
-        // A connection state object is available, and has a default id
-        // You can subclass ConnectionState and pass an alternate factory
-        // to override it. It is useful if you want to store custom
-        // attributes per connection (authenticated bool flag, attributes, etc...)
-       ss << "id: " << connectionState->getId() << std::endl;
-
-        // The uri the client did connect to.
-        ss << "Uri: " << msg->openInfo.uri << std::endl;
-
-        ss << "Headers:" << std::endl;
+        std::string header;
         for (auto it : msg->openInfo.headers)
         {
-            ss << "\t" << it.first << ": " << it.second << std::endl;
+            header += it.first + ": " + it.second + " ";
         }
-        SPDLOG_INFO(ss.str());
+        spdlog::info("Remote ip:{} id:{} Uri:{} Headers:{} New connection", connectionState->getRemoteIp(), connectionState->getId(), msg->openInfo.uri, header);
     }
     else if (msg->type == ix::WebSocketMessageType::Message)
     {
@@ -116,29 +159,30 @@ void ServerUpdate::MessageCallback(std::shared_ptr<ix::ConnectionState> connecti
         // All connected clients are available in an std::set. See the broadcast cpp example.
         // Second parameter tells whether we are sending the message in binary or text mode.
         // Here we send it in the same mode as it was received.
-        if(need_update.load()==true)
-            one_hash = OneHash();
+
         if (!msg->str.empty())
         {
             nlohmann::json pack=nlohmann::json::from_cbor(msg->str);
             if (pack["command"]=="get_hash" && pack.count("hash"))
             {
-                if (pack["hash"].get<size_t>() == one_hash)
+                size_t curent_hash = pack["hash"].get<size_t>();
+                spdlog::trace("Hash client:{} server:{}", curent_hash, one_hash);
+                if (curent_hash == one_hash)
                 {
-                    SPDLOG_TRACE("Equal hash");
+                    spdlog::trace("Remote ip:{} Equal hash", connectionState->getRemoteIp());
                     return;
                 }
                 else
                 {
                     nlohmann::json who;
-                    who["command"] = "get_list";
-                    SPDLOG_TRACE("Get list");
+                    who["command"] = "send_list";
+                    spdlog::trace("Remote ip:{} Send list", connectionState->getRemoteIp());
                     webSocket.sendBinary(nlohmann::json::to_cbor(who));
                    
                 }
                
             }
-            if (pack["command"] == "send_list"&& pack.count("file_list"))
+            else if (pack["command"] == "get_list"&& pack.count("file_list"))
             {
                 auto file_list = pack["file_list"].get<std::map<std::string, std::size_t>>();
                 nlohmann::json data_list;
@@ -153,7 +197,7 @@ void ServerUpdate::MessageCallback(std::shared_ptr<ix::ConnectionState> connecti
                             return hash == p.second && file == p.first;
                         }))
                     {
-                        SPDLOG_INFO("Send update file: {}", file);
+                        spdlog::trace("Remote ip:{} Send update file : {}", connectionState->getRemoteIp(), file);
                         data_list["data_file"][file]=nlohmann::json::binary(content);
                     }
 
@@ -163,23 +207,23 @@ void ServerUpdate::MessageCallback(std::shared_ptr<ix::ConnectionState> connecti
 
             }
         }
-     //   std::cout << "Received: " << msg->str << std::endl;
-
-      //  webSocket.send(msg->str, msg->binary);
     }
     else if (msg->type == ix::WebSocketMessageType::Ping)
     {
-        SPDLOG_TRACE("Ping OK");
+        spdlog::trace("Remote ip:{} Ping OK", connectionState->getRemoteIp());
     }
     else if (msg->type == ix::WebSocketMessageType::Pong)
     {
-        SPDLOG_TRACE("Pong OK");
+        spdlog::trace("Remote ip:{} Pong OK", connectionState->getRemoteIp());
     }
+
 
 }
 ServerUpdate::ServerUpdate(const std::string& dir_path_):dir_path(dir_path_)
 {
     ix::initNetSystem();
+    fileWatcher = new efsw::FileWatcher();
+    listener=new UpdateListener(need_update);
     StartUpdate();
     // Run a server on localhost at a given port.
     // Bound host name, max connections and listen backlog can also be passed in as parameters.
@@ -212,10 +256,11 @@ ServerUpdate::~ServerUpdate()
 }
 int main()
 {
-   
-
-    ServerUpdate("D:\\test2");
+    
     spdlog::set_level(spdlog::level::trace);
+   // spdlog::set_level(spdlog::level::trace);
+    ServerUpdate("D:\\test2");
+    
 
 
 

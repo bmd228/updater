@@ -10,9 +10,19 @@
 #include <fstream>
 #include "json.hpp"
 #include "spdlog/spdlog.h"
+#include <codecvt> // codecvt_utf8
+#include <locale>  
 using namespace std;
 namespace fs = std::filesystem;
-
+std::wstring from_utf8(const std::string& utf8_string) {
+    static std::wstring_convert<std::codecvt_utf8<wchar_t>> utf8_conv;
+    return utf8_conv.from_bytes(utf8_string);
+}
+std::string to_utf8(const std::wstring& wide_string)
+{
+    static std::wstring_convert<std::codecvt_utf8<wchar_t>> utf8_conv;
+    return utf8_conv.to_bytes(wide_string);
+}
 class UpdateClient
 {
 public:
@@ -23,7 +33,7 @@ public:
 
 private:
     void MessageCallback(const ix::WebSocketMessagePtr& msg);
-    std::size_t hash_file(const std::string& filepath);
+    std::size_t hash_file(const fs::path& filepath);
     std::size_t one_hash{0};
     const std::string dir_path;
     ix::WebSocket webSocket;
@@ -56,25 +66,39 @@ void UpdateClient::MessageCallback(const ix::WebSocketMessagePtr& msg)
     {
         
         nlohmann::json pack= nlohmann::json::from_cbor(msg->str);
-        pack["hash"] = one_hash;
-        if (pack.count("command") && pack["command"] == "get_list")
+        
+        if (pack.count("command") && pack["command"] == "send_hash")
+        {
+            pack["hash"] = one_hash;
+            pack["command"] = "get_hash";
+            
+            spdlog::trace("Send hash");
+        }
+        else if (pack.count("command") && pack["command"] == "send_list")
         {
             pack["file_list"] = file_hash;
-            pack["command"] = "send_list";
-            SPDLOG_TRACE("Send list");
+            pack["command"] = "get_list";
+            spdlog::trace("Send list");
         }
-        if (pack.count("command") && pack["command"] == "send_data_file")
+        else if (pack.count("command") && pack["command"] == "send_data_file")
         {
             for (const auto& [file_path,data] : pack["data_file"].items())
             {
+                auto path_file = fs::path(from_utf8(dir_path) + L"\\" + from_utf8(file_path));
+                if (!fs::exists(path_file.parent_path())) {
+                    if (!fs::create_directories(path_file.parent_path())) {
+                        spdlog::error("Failed to create directory: {}", dir_path);
+                        return;
+                    }
+                }
                 
-                std::ofstream file(dir_path+"\\"+ file_path, std::ios::binary);
+                std::ofstream file(path_file, std::ios::binary);
                 if (!file.is_open()) {
-                    SPDLOG_ERROR("Failed to open file:{} ", file_path);
+                    spdlog::error("Failed to open file:{} ", file_path);
                     return ; // Возврат 0 в случае ошибки
                 }
                 file.seekp(std::ios::beg);
-                SPDLOG_INFO("Update file :{} ", dir_path + "\\" + file_path);
+                spdlog::info("Update file :{} ", path_file.u8string());
                
 
                 if (data.is_binary())
@@ -85,6 +109,11 @@ void UpdateClient::MessageCallback(const ix::WebSocketMessagePtr& msg)
 
             }
             one_hash = OneHash();
+            pack.erase("data_file");
+            pack["hash"] = one_hash;
+            pack["command"] = "get_hash";
+            spdlog::trace("Send hash");
+
        }
         webSocket.sendBinary(nlohmann::json::to_cbor(pack));
     }
@@ -95,12 +124,12 @@ void UpdateClient::MessageCallback(const ix::WebSocketMessagePtr& msg)
         ss << "#retries: " << msg->errorInfo.retries << std::endl;
         ss << "Wait time(ms): " << msg->errorInfo.wait_time << std::endl;
         ss << "HTTP Status: " << msg->errorInfo.http_status << std::endl;
-        SPDLOG_ERROR(ss.str());
+        spdlog::error(ss.str());
         
     }
     if (msg->type == ix::WebSocketMessageType::Open)
     {
-        SPDLOG_TRACE("Open connection");
+        spdlog::trace("Open connection");
         nlohmann::json pack;
         pack["hash"] = one_hash;
         pack["command"] = "get_hash";
@@ -109,7 +138,15 @@ void UpdateClient::MessageCallback(const ix::WebSocketMessagePtr& msg)
     }
     if (msg->type == ix::WebSocketMessageType::Close)
     {
-        SPDLOG_TRACE("Close connection");
+        spdlog::trace("Close connection");
+    }
+    if (msg->type == ix::WebSocketMessageType::Ping)
+    {
+        spdlog::trace("Ping OK");
+    }
+    if (msg->type == ix::WebSocketMessageType::Pong)
+    {
+        spdlog::trace("Pong OK");
     }
 }
 UpdateClient::~UpdateClient()
@@ -123,7 +160,7 @@ void UpdateClient::HashFS()
         if (entry.is_regular_file())
         {
             fs::path relative_path = entry.path().lexically_relative(dir_path);
-            file_hash.emplace(relative_path.u8string(), hash_file(entry.path().u8string()));
+            file_hash.insert_or_assign(relative_path.u8string(), hash_file(entry.path()));
             //auto pos = entry.path().parent_path().u8string().find(dir_path);
             //if (pos != std::u16string::npos)
             //{
@@ -146,12 +183,13 @@ size_t UpdateClient::OneHash()
     }
     return result;
 }
-std::size_t UpdateClient::hash_file(const std::string& filepath) {
+std::size_t UpdateClient::hash_file(const fs::path& filepath) {
     // Открываем файл для чтения в бинарном режиме
     std::ifstream file(filepath, std::ios::binary);
-    if (!file.is_open()) {
-        SPDLOG_ERROR("Failed to open file:{} ", filepath);
-        return 0; // Возврат 0 в случае ошибки
+    while (!file.is_open()) {
+        spdlog::error("Failed to open file:{} ", filepath.u8string());
+        std::this_thread::sleep_for(5s);
+     //   return 0; // Возврат 0 в случае ошибки
     }
 
     // Создаем объект хэш-функции
@@ -170,6 +208,7 @@ int main()
 
     //// The message can be sent in BINARY mode (useful if you send MsgPack data for example)
     //webSocket.sendBinary("some serialized binary data");
+    
     spdlog::set_level(spdlog::level::trace);
     UpdateClient client("D:\\test");
     
