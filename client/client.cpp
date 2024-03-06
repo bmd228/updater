@@ -29,12 +29,10 @@ public:
     UpdateClient(const std::string& dir_path);
     ~UpdateClient();    
     void HashFS();
-    size_t OneHash();
 
 private:
     void MessageCallback(const ix::WebSocketMessagePtr& msg);
     std::size_t hash_file(const fs::path& filepath);
-    std::size_t one_hash{0};
     const std::string dir_path;
     ix::WebSocket webSocket;
     std::map<std::string, std::size_t> file_hash;
@@ -42,7 +40,8 @@ private:
 
 UpdateClient::UpdateClient(const std::string& dir_path_):dir_path(dir_path_)
 {
-    one_hash = OneHash();
+   // one_hash = OneHash();
+    HashFS();
     ix::initNetSystem();
     std::string url("ws://localhost:8071/");
     webSocket.setUrl(url);
@@ -69,17 +68,12 @@ void UpdateClient::MessageCallback(const ix::WebSocketMessagePtr& msg)
         
         if (pack.count("command") && pack["command"] == "send_hash")
         {
-            pack["hash"] = one_hash;
+            pack["hash"] = file_hash;
             pack["command"] = "get_hash";
             
-            spdlog::trace("Send hash");
+            spdlog::trace("Get hash");
         }
-        else if (pack.count("command") && pack["command"] == "send_list")
-        {
-            pack["file_list"] = file_hash;
-            pack["command"] = "get_list";
-            spdlog::trace("Send list");
-        }
+
         else if (pack.count("command") && pack["command"] == "send_data_file")
         {
             for (const auto& [file_path,data] : pack["data_file"].items())
@@ -93,9 +87,9 @@ void UpdateClient::MessageCallback(const ix::WebSocketMessagePtr& msg)
                 }
                 
                 std::ofstream file(path_file, std::ios::binary);
-                if (!file.is_open()) {
+                while (!file.is_open()) {
                     spdlog::error("Failed to open file:{} ", file_path);
-                    return ; // Возврат 0 в случае ошибки
+                    std::this_thread::sleep_for(5s);
                 }
                 file.seekp(std::ios::beg);
                 spdlog::info("Update file :{} ", path_file.u8string());
@@ -108,33 +102,23 @@ void UpdateClient::MessageCallback(const ix::WebSocketMessagePtr& msg)
                 file.close();
 
             }
-            one_hash = OneHash();
+            HashFS();
             pack.erase("data_file");
-            pack["hash"] = one_hash;
+            pack["hash"] = file_hash;
             pack["command"] = "get_hash";
-            spdlog::trace("Send hash");
+            spdlog::trace("Get hash");
 
        }
         webSocket.sendBinary(nlohmann::json::to_cbor(pack));
     }
     if (msg->type == ix::WebSocketMessageType::Error)
     {
-        std::stringstream ss;
-        ss << "Error: " << msg->errorInfo.reason << std::endl;
-        ss << "#retries: " << msg->errorInfo.retries << std::endl;
-        ss << "Wait time(ms): " << msg->errorInfo.wait_time << std::endl;
-        ss << "HTTP Status: " << msg->errorInfo.http_status << std::endl;
-        spdlog::error(ss.str());
+        spdlog::error("Error: {} #retries: {} Wait time(ms): {} HTTP Status: {}", msg->errorInfo.reason, msg->errorInfo.retries, msg->errorInfo.wait_time, msg->errorInfo.http_status);
         
     }
     if (msg->type == ix::WebSocketMessageType::Open)
     {
-        spdlog::trace("Open connection");
-        nlohmann::json pack;
-        pack["hash"] = one_hash;
-        pack["command"] = "get_hash";
-      //  std::vector<std::uint8_t> v_cbor = nlohmann::json::to_cbor(pack);
-        webSocket.sendBinary(nlohmann::json::to_cbor(pack));
+        spdlog::trace("Open connection");;
     }
     if (msg->type == ix::WebSocketMessageType::Close)
     {
@@ -160,29 +144,10 @@ void UpdateClient::HashFS()
         if (entry.is_regular_file())
         {
             fs::path relative_path = entry.path().lexically_relative(dir_path);
-            file_hash.insert_or_assign(relative_path.u8string(), hash_file(entry.path()));
-            //auto pos = entry.path().parent_path().u8string().find(dir_path);
-            //if (pos != std::u16string::npos)
-            //{
-            //    auto sd = entry.path().parent_path().u8string().substr(pos + dir_path.size());
-            //    file_hash.emplace(sd, hash_file(entry.path().u8string()));
-            //}
-
-           
+            file_hash.insert_or_assign(relative_path.u8string(), hash_file(entry.path()));      
        }
 }
-size_t UpdateClient::OneHash()
-{
-    HashFS();
-    std::size_t result = 0;
 
-    // Сливаем хэши отсортированных элементов вектора
-    for (auto  &&[file,hash] : file_hash) {
-        // Вычисляем новый хэш как XOR текущего результата и хэша элемента
-        result ^= hash;
-    }
-    return result;
-}
 std::size_t UpdateClient::hash_file(const fs::path& filepath) {
     // Открываем файл для чтения в бинарном режиме
     std::ifstream file(filepath, std::ios::binary);
@@ -201,16 +166,13 @@ std::size_t UpdateClient::hash_file(const fs::path& filepath) {
     file.close();
     return file_hash;
 }
-int main()
+int main(int argc, char* argv[])
 {
-
-    //webSocket.send("hello world");
-
-    //// The message can be sent in BINARY mode (useful if you send MsgPack data for example)
-    //webSocket.sendBinary("some serialized binary data");
-    
+    std::string path= "D:\\test";
+    if (argc > 1)
+        path = argv[1];
     spdlog::set_level(spdlog::level::trace);
-    UpdateClient client("D:\\test");
+    UpdateClient client(path);
     
     while (true)
     {

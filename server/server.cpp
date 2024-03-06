@@ -28,7 +28,7 @@ std::string to_utf8(const std::wstring& wide_string)
 }
 class UpdateListener : public efsw::FileWatchListener {
 public:
-    UpdateListener(std::atomic_bool& need_update_):need_update(need_update_)
+    UpdateListener(std::unordered_map<std::string, std::atomic_bool>& need_update_):need_update(need_update_)
     {
 
     }
@@ -37,13 +37,19 @@ public:
         std::string oldFilename) override {
         switch (action) {
         case efsw::Actions::Add:
-            need_update.store(true);
+            for (auto& k : need_update)
+            {
+                k.second.store(true);
+            }
             spdlog::info("File add:{}", filename);
             break;
         case efsw::Actions::Delete:
             break;
         case efsw::Actions::Modified:
-            need_update.store(true);
+            for (auto& k : need_update)
+            {
+                k.second.store(true);
+            }
             spdlog::info("File modified:{}", filename);
             break;
         case efsw::Actions::Moved:
@@ -53,7 +59,7 @@ public:
         }
     }
 private:
-    std::atomic_bool&                                            need_update;
+    std::unordered_map<std::string, std::atomic_bool>&                                            need_update;
 };
 class ServerUpdate
 {
@@ -64,11 +70,11 @@ public:
     void StartUpdate();
 private:
     void HashFS();
-    size_t OneHash();
+   // size_t OneHash();
     std::tuple<std::size_t, std::vector<uint8_t>> ServerUpdate::hash_file(const fs::path& filepath);
-    std::size_t one_hash{ 0 };
+  //  std::size_t one_hash{ 0 };
     std::unique_ptr< ix::WebSocketServer> server;
-    std::atomic_bool                                            need_update{ false };
+    std::unordered_map<std::string,std::atomic_bool>                                            need_update;
     std::string dir_path;
     std::map<std::string, std::tuple<std::size_t,std::vector<uint8_t>>> file_hash;
     efsw::FileWatcher* fileWatcher;
@@ -77,7 +83,7 @@ private:
 void ServerUpdate::StartUpdate()
 {
     
-    one_hash = OneHash();
+    HashFS();
     efsw::WatchID watchID = fileWatcher->addWatch(dir_path, listener, true);
     fileWatcher->watch();
    
@@ -95,25 +101,14 @@ void ServerUpdate::HashFS()
 
         }
 }
-size_t ServerUpdate::OneHash()
-{
-    HashFS();
-    std::size_t result = 0;
 
-    // Сливаем хэши отсортированных элементов вектора
-    for (auto&& [file, pair] : file_hash) {
-        // Вычисляем новый хэш как XOR текущего результата и хэша элемента
-        auto [hash, data] = pair;
-        result ^= hash;
-    }
-    return result;
-}
 std::tuple<std::size_t, std::vector<uint8_t>> ServerUpdate::hash_file(const fs::path& filepath) {
     // Открываем файл для чтения в бинарном режиме
     std::ifstream file(filepath, std::ios::binary);
-    while (!file.is_open()) {
+    if (!file.is_open()) {
         spdlog::error("Failed to open file:{} ", filepath.u8string());
         std::this_thread::sleep_for(5s);
+        HashFS();
        // return std::make_tuple(0,std::vector<uint8_t>()); // Возврат 0 в случае ошибки
     }
 
@@ -131,16 +126,19 @@ void ServerUpdate::MessageCallback(std::shared_ptr<ix::ConnectionState> connecti
 {
     // The ConnectionState object contains information about the connection,
       // at this point only the client ip address and the port.
-   
-    
-    if (need_update.load() == true)
+    if (need_update.count(connectionState->getId())==0)
     {
-        one_hash = OneHash();
-        need_update.store(false);
+        need_update[connectionState->getId()].store(false);
+    }
+    if (need_update[connectionState->getId()].load() == true)
+    {
+        HashFS();
+        need_update[connectionState->getId()].store(false);
         nlohmann::json pack;
         pack["command"] = "send_hash";
         webSocket.sendBinary(nlohmann::json::to_cbor(pack));
         spdlog::trace("Need update");
+        spdlog::trace("Send hash");
         return;
 
     }
@@ -152,6 +150,10 @@ void ServerUpdate::MessageCallback(std::shared_ptr<ix::ConnectionState> connecti
             header += it.first + ": " + it.second + " ";
         }
         spdlog::info("Remote ip:{} id:{} Uri:{} Headers:{} New connection", connectionState->getRemoteIp(), connectionState->getId(), msg->openInfo.uri, header);
+        nlohmann::json pack;
+        pack["command"] = "send_hash";
+        webSocket.sendBinary(nlohmann::json::to_cbor(pack));
+        spdlog::trace("Send hash");
     }
     else if (msg->type == ix::WebSocketMessageType::Message)
     {
@@ -165,47 +167,39 @@ void ServerUpdate::MessageCallback(std::shared_ptr<ix::ConnectionState> connecti
             nlohmann::json pack=nlohmann::json::from_cbor(msg->str);
             if (pack["command"]=="get_hash" && pack.count("hash"))
             {
-                size_t curent_hash = pack["hash"].get<size_t>();
-                spdlog::trace("Hash client:{} server:{}", curent_hash, one_hash);
-                if (curent_hash == one_hash)
+                auto files_client = pack["hash"].get<std::unordered_map<std::string, std::size_t>>();
+                std::unordered_map<std::string, std::tuple<std::size_t, std::vector<uint8_t>>> file_list;
+                std::copy_if(file_hash.begin(), file_hash.end(), std::inserter(file_list, file_list.end()), [&files_client](const auto& p) {
+                    auto search = files_client.find(p.first);
+                    if (auto search = files_client.find(p.first); search != files_client.end())
+                        return search->second != std::get<0>(p.second);
+                    else
+                        return true;
+
+                    });
+                if (file_list.empty())
                 {
                     spdlog::trace("Remote ip:{} Equal hash", connectionState->getRemoteIp());
                     return;
                 }
                 else
                 {
-                    nlohmann::json who;
-                    who["command"] = "send_list";
-                    spdlog::trace("Remote ip:{} Send list", connectionState->getRemoteIp());
-                    webSocket.sendBinary(nlohmann::json::to_cbor(who));
-                   
+                    nlohmann::json data_list;
+                    for (auto& pair : file_list)
+                    {
+                        const auto& file = pair.first;
+                        const auto& content = std::get<1>(pair.second);
+                        spdlog::trace("Remote ip:{} Send update file : {}", connectionState->getRemoteIp(), file);
+                        data_list["data_file"][file] = nlohmann::json::binary(content);
+
+                    }
+                    data_list["command"] = "send_data_file";
+                    spdlog::trace("Remote ip:{} Send data file", connectionState->getRemoteIp());
+                    webSocket.sendBinary(nlohmann::json::to_cbor(data_list));
                 }
                
             }
-            else if (pack["command"] == "get_list"&& pack.count("file_list"))
-            {
-                auto file_list = pack["file_list"].get<std::map<std::string, std::size_t>>();
-                nlohmann::json data_list;
-                for (auto& pair : file_hash)
-                {
-                    const auto& file = pair.first;
-                    const auto& tuple = pair.second;
-                    const auto& hash = std::get<0>(tuple);
-                    const auto& content = std::get<1>(tuple);
-                    if (!std::any_of(file_list.begin(), file_list.end(), [&hash, &file](const std::pair<std::string, std::size_t>& p)
-                        {
-                            return hash == p.second && file == p.first;
-                        }))
-                    {
-                        spdlog::trace("Remote ip:{} Send update file : {}", connectionState->getRemoteIp(), file);
-                        data_list["data_file"][file]=nlohmann::json::binary(content);
-                    }
-
-                }
-                data_list["command"] = "send_data_file";
-                webSocket.sendBinary(nlohmann::json::to_cbor(data_list));
-
-            }
+          
         }
     }
     else if (msg->type == ix::WebSocketMessageType::Ping)
@@ -215,6 +209,11 @@ void ServerUpdate::MessageCallback(std::shared_ptr<ix::ConnectionState> connecti
     else if (msg->type == ix::WebSocketMessageType::Pong)
     {
         spdlog::trace("Remote ip:{} Pong OK", connectionState->getRemoteIp());
+    }
+    else if (msg->type == ix::WebSocketMessageType::Close)
+    {
+        need_update.erase(connectionState->getId());
+        spdlog::trace("Remote ip:{} Close connection", connectionState->getRemoteIp());
     }
 
 
@@ -253,26 +252,23 @@ ServerUpdate::ServerUpdate(const std::string& dir_path_):dir_path(dir_path_)
 
 ServerUpdate::~ServerUpdate()
 {
+    server->stop();
+    ix::uninitNetSystem();
 }
-int main()
+int main(int argc, char* argv[])
 {
-    
+    std::string path = "D:\\test";
+    if (argc > 1)
+        path = argv[1];
+    else
+    {
+        spdlog::error("Set directory");
+        return 0;
+    }
     spdlog::set_level(spdlog::level::trace);
    // spdlog::set_level(spdlog::level::trace);
-    ServerUpdate("D:\\test2");
+    ServerUpdate server(path);
+
     
-
-
-
-
- //   while (true)
- //   {
- //       cout << "Hello CMake." << endl;
- //   }
-	//
-	//	//wd::watch(fs::path("D:\\test"),
-	//	//	[&](const fs::path& path) { need_update.store(true, std::memory_order_seq_cst); });
-	//cout << "Hello CMake." << endl;
-    ix::uninitNetSystem();
 	return 0;
 }
